@@ -1,9 +1,12 @@
 package com.itranswarp.web.controller;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
+import jakarta.annotation.PostConstruct;
 
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+
+import com.itranswarp.common.AbstractService;
+import com.itranswarp.markdown.Markdown;
 import com.itranswarp.redis.RedisService;
 import com.itranswarp.search.AbstractSearcher;
 import com.itranswarp.service.AdService;
@@ -12,6 +15,7 @@ import com.itranswarp.service.ArticleService;
 import com.itranswarp.service.AttachmentService;
 import com.itranswarp.service.BoardService;
 import com.itranswarp.service.EncryptService;
+import com.itranswarp.service.HeadlineService;
 import com.itranswarp.service.LinkService;
 import com.itranswarp.service.NavigationService;
 import com.itranswarp.service.SettingService;
@@ -19,56 +23,81 @@ import com.itranswarp.service.SinglePageService;
 import com.itranswarp.service.TextService;
 import com.itranswarp.service.UserService;
 import com.itranswarp.service.WikiService;
+import com.itranswarp.web.view.i18n.Translators;
 
-public abstract class AbstractController {
+public abstract class AbstractController extends AbstractService {
 
-	protected final Logger logger = LoggerFactory.getLogger(getClass());
+    protected static final String ID = "{id:[0-9]{1,17}}";
+    protected static final String ID2 = "{id2:[0-9]{1,17}}";
 
-	protected static final String ID = "{id:[0-9]{1,17}}";
-	protected static final String ID2 = "{id2:[0-9]{1,17}}";
+    @Value("${spring.profiles.active:native}")
+    String activeProfile;
 
-	@Autowired
-	protected EncryptService encryptService;
+    @Value("${spring.application.name:iTranswarp")
+    protected String name;
 
-	@Autowired
-	protected RedisService redisService;
+    protected boolean dev;
 
-	@Autowired
-	protected AdService adService;
+    @PostConstruct
+    public void initEnv() {
+        this.dev = "native".equals(this.activeProfile);
+        if (this.dev) {
+            logger.warn("application is set to dev mode.");
+        }
+    }
 
-	@Autowired
-	protected ArticleService articleService;
+    @Autowired
+    protected EncryptService encryptService;
 
-	@Autowired
-	protected AttachmentService attachmentService;
+    @Autowired
+    protected RedisService redisService;
 
-	@Autowired
-	protected BoardService boardService;
+    @Autowired
+    protected AdService adService;
 
-	@Autowired
-	protected LinkService linkService;
+    @Autowired
+    protected ArticleService articleService;
 
-	@Autowired
-	protected NavigationService navigationService;
+    @Autowired
+    protected AttachmentService attachmentService;
 
-	@Autowired
-	protected SettingService settingService;
+    @Autowired
+    protected BoardService boardService;
 
-	@Autowired
-	protected SinglePageService singlePageService;
+    @Autowired
+    protected HeadlineService headlineService;
 
-	@Autowired
-	protected TextService textService;
+    @Autowired
+    protected LinkService linkService;
 
-	@Autowired
-	protected UserService userService;
+    @Autowired
+    protected NavigationService navigationService;
 
-	@Autowired
-	protected WikiService wikiService;
+    @Autowired
+    protected SettingService settingService;
 
-	@Autowired
-	protected AntiSpamService antiSpamService;
+    @Autowired
+    protected SinglePageService singlePageService;
 
-	@Autowired(required = false)
-	protected AbstractSearcher searcher;
+    @Autowired
+    protected TextService textService;
+
+    @Autowired
+    protected UserService userService;
+
+    @Autowired
+    protected WikiService wikiService;
+
+    @Autowired
+    protected AntiSpamService antiSpamService;
+
+    @Autowired
+    protected AbstractSearcher searcher;
+
+    @Autowired
+    protected Translators translators;
+
+    @Autowired
+    protected Markdown markdown;
+
 }

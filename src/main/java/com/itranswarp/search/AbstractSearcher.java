@@ -1,223 +1,349 @@
 package com.itranswarp.search;
 
+import java.io.File;
 import java.io.IOException;
+import java.io.StringReader;
+import java.net.URLDecoder;
+import java.security.CodeSource;
 import java.util.Arrays;
+import java.util.List;
+import java.util.stream.Collectors;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
-import javax.annotation.PostConstruct;
+import jakarta.annotation.PostConstruct;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.lionsoul.jcseg.ISegment;
+import org.lionsoul.jcseg.dic.ADictionary;
+import org.lionsoul.jcseg.dic.HashMapDictionary;
+import org.lionsoul.jcseg.extractor.impl.TextRankKeywordsExtractor;
+import org.lionsoul.jcseg.segmenter.SegmenterConfig;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 
+import com.itranswarp.common.AbstractService;
 import com.itranswarp.markdown.Markdown;
 import com.itranswarp.model.Article;
-import com.itranswarp.model.SinglePage;
 import com.itranswarp.model.Wiki;
 import com.itranswarp.model.WikiPage;
+import com.itranswarp.service.ArticleService;
 import com.itranswarp.service.TextService;
-import com.itranswarp.warpdb.Page;
+import com.itranswarp.service.WikiService;
 import com.itranswarp.warpdb.PagedResults;
 
-public abstract class AbstractSearcher {
+public abstract class AbstractSearcher extends AbstractService {
 
-	protected final Logger logger = LoggerFactory.getLogger(getClass());
+    public static enum IndexStatus {
+        /**
+         * Index is newly created.
+         */
+        CREATED,
 
-	@Value("${spring.search.highlight-style-name:x-highlight}")
-	private String highlightStyle = "x-highlight";
+        /**
+         * Index exist.
+         */
+        EXIST,
 
-	@Value("${spring.search.max-query-length:50}")
-	private int maxQueryLength;
+        /**
+         * Index is just removed.
+         */
+        REMOVED,
 
-	@Value("${spring.search.max-keywords:3}")
-	private int maxKeywords;
+        /**
+         * Index create/remove failed.
+         */
+        FAILED
+    }
 
-	@Value("${spring.search.fragment-size:30}")
-	private int fragmentSize;
+    @Value("${spring.search.max-query-length:50}")
+    private int maxQueryLength;
 
-	@Value("${spring.search.max-page-index:5}")
-	private int maxPageIndex;
+    @Autowired
+    private Markdown markdown;
 
-	@Value("${spring.search.page-size:10}")
-	private int pageSize;
+    @Autowired
+    private ArticleService articleService;
 
-	private String highlightPreTag = "<span class=\"x-highlight\">";
-	private String highlightPostTag = "</span>";
+    @Autowired
+    private WikiService wikiService;
 
-	@Autowired
-	private Markdown markdown;
+    @Autowired
+    private TextService textService;
 
-	@Autowired
-	private TextService textService;
+    private SegmenterConfig config;
+    private ADictionary dict;
 
-	@PostConstruct
-	public void initAbstractSearcher() {
-		this.highlightPreTag = "<span class=\"" + this.highlightStyle + "\">";
-	}
+    private boolean isReady = false;
 
-	/**
-	 * Get engine name.
-	 * 
-	 * @return Engine name.
-	 */
-	public abstract String getEngineName();
+    @PostConstruct
+    public void init() throws Exception {
+        this.config = new SegmenterConfig(true);
+        this.config.EN_WORD_SEG = false;
+        this.dict = createCustomizedDictionary(config, true, true);
+        createIndex();
+    }
 
-	protected int getFragmentSize() {
-		return this.fragmentSize;
-	}
+    /**
+     * copied from <code>DictionaryFactory.createDefaultDictionary()</code> to fix
+     * loading from classpath:
+     */
+    static ADictionary createCustomizedDictionary(SegmenterConfig config, boolean sync, boolean loadDic) {
+        final ADictionary dic = new HashMapDictionary(config, sync) {
+            /**
+             * Fix load classpath in SpringBoot:
+             */
+            @Override
+            public void loadClassPath() throws IOException {
+                final Class<?> dClass = ADictionary.class;
+                final CodeSource codeSrc = dClass.getProtectionDomain().getCodeSource();
+                if (codeSrc == null) {
+                    return;
+                }
 
-	protected String getHighlightPreTag() {
-		return this.highlightPreTag;
-	}
+                final String codePath = codeSrc.getLocation().getPath();
+                // FIXME: add test for endsWith(".jar!/"):
+                if (codePath.toLowerCase().endsWith(".jar") || codePath.toLowerCase().endsWith(".jar!/")) {
+                    final ZipInputStream zip = new ZipInputStream(codeSrc.getLocation().openStream());
+                    while (true) {
+                        ZipEntry e = zip.getNextEntry();
+                        if (e == null) {
+                            break;
+                        }
 
-	protected String getHighlightPostTag() {
-		return this.highlightPostTag;
-	}
+                        String fileName = e.getName();
+                        if (fileName.endsWith(".lex") && fileName.startsWith("lexicon/lex-")) {
+                            load(dClass.getResourceAsStream("/" + fileName));
+                        }
+                    }
+                } else {
+                    // now, the classpath is an IDE directory
+                    // like eclipse ./bin or maven ./target/classes/
+                    final File lexiconDir = new File(URLDecoder.decode(codeSrc.getLocation().getFile(), "utf-8"));
+                    loadDirectory(lexiconDir.getPath() + File.separator + "lexicon");
+                }
+            }
 
-	/**
-	 * Parse query to String array, or null if parse failed.
-	 * 
-	 * @param q
-	 * @return
-	 */
-	private String[] parseQuery(String q) {
-		if (q == null) {
-			return null;
-		}
-		if (q.length() > this.maxQueryLength) {
-			q = q.substring(0, this.maxQueryLength);
-		}
-		q = q.strip();
-		if (q.isEmpty()) {
-			return null;
-		}
-		String[] ss = q.split("[\\s\\;\\,\\.\\?\\+\\&\\-\\？\\，\\、\\。\\；]+");
-		String[] qs = Arrays.stream(ss).filter(s -> !s.isEmpty()).limit(this.maxKeywords).toArray(String[]::new);
-		if (qs.length == 0) {
-			return null;
-		}
-		return qs;
-	}
+        };
+        if (!loadDic) {
+            return dic;
+        }
 
-	/**
-	 * Search by keywords and return results. Return null if search condition is
-	 * invalid.
-	 */
-	public PagedResults<SearchableDocument> search(String q, int pageIndex) throws Exception {
-		String[] qs = parseQuery(q);
-		if (qs == null) {
-			return null;
-		}
-		if (pageIndex < 1) {
-			pageIndex = 1;
-		} else if (pageIndex > this.maxPageIndex) {
-			pageIndex = this.maxPageIndex;
-		}
-		Hits hits = search(qs, System.currentTimeMillis(), pageIndex * this.pageSize, (pageIndex - 1) * this.pageSize,
-				this.pageSize);
-		logger.info("hits: total = {}, page = {}, returned = {}.", hits.total, pageIndex, hits.documents.size());
-		int totalItems = hits.total;
-		int totalPages = totalItems / this.pageSize + (totalItems % this.pageSize > 0 ? 1 : 0);
-		if (totalPages > this.maxPageIndex) {
-			totalPages = this.maxPageIndex;
-		}
-		Page page = new Page(pageIndex, this.pageSize, totalPages, totalItems);
-		return new PagedResults<>(page, hits.documents);
-	}
+        try {
+            /*
+             * @Note: updated at 2016/07/07
+             * 
+             * check and load all the lexicons with more than one path if specified none
+             * lexicon paths (config.getLexiconPath() is null) And we directly load the
+             * default lexicons that in the class path
+             */
+            String[] lexPath = config.getLexiconPath();
+            if (lexPath == null) {
+                dic.loadClassPath();
+            } else {
+                for (String lPath : lexPath)
+                    dic.loadDirectory(lPath);
+                if (config.isAutoload())
+                    dic.startAutoload();
+            }
 
-	/**
-	 * Search by parsed keywords.
-	 * 
-	 * @param qs         Parsed keywords.
-	 * @param maxResults The max result list.
-	 * @param offset     The offset of result list.
-	 * @param size       The size of result list.
-	 * @return Hits object.
-	 * @throws IOException
-	 */
-	protected abstract Hits search(String[] qs, long timestamp, int maxResults, int offset, int size) throws Exception;
+            /*
+             * added at 2017/06/10 check and reset synonyms net of the current Dictionary
+             */
+            dic.resetSynonymsNet();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
 
-	private SearchableDocument toSearchableDocument(Article obj) {
-		SearchableDocument document = new SearchableDocument();
-		document.type = "article";
-		document.id = obj.id;
-		document.name = obj.name;
-		document.publishAt = obj.publishAt;
-		document.content = markdown.toText(textService.getById(obj.textId).content);
-		document.url = "/article/" + obj.id;
-		return document;
-	}
+        return dic;
+    }
 
-	private SearchableDocument toSearchableDocument(Wiki obj) {
-		SearchableDocument document = new SearchableDocument();
-		document.type = "wiki";
-		document.id = obj.id;
-		document.name = obj.name;
-		document.publishAt = obj.publishAt;
-		document.content = markdown.toText(textService.getById(obj.textId).content);
-		document.url = "/wiki/" + obj.id;
-		return document;
-	}
+    public boolean ready() {
+        return this.isReady;
+    }
 
-	private SearchableDocument toSearchableDocument(WikiPage obj) {
-		SearchableDocument document = new SearchableDocument();
-		document.type = "wikipage";
-		document.id = obj.id;
-		document.name = obj.name;
-		document.publishAt = obj.publishAt;
-		document.content = markdown.toText(textService.getById(obj.textId).content);
-		document.url = "/wiki/" + obj.parentId + "/" + obj.id;
-		return document;
-	}
+    public void indexAll() throws Exception {
+        logger.info("Try reindex all documents...");
+        for (int page = 1; page < 1000; page++) {
+            PagedResults<Article> r = articleService.getArticles(page, 1000);
+            if (page > r.page.totalPages) {
+                break;
+            }
+            logger.info("try index {} articles...", r.results.size());
+            indexSearchableDocuments(r.results.stream().map(this::toSearchableDocument).collect(Collectors.toList()));
+        }
+        for (Wiki wiki : wikiService.getWikis()) {
+            List<WikiPage> wps = wikiService.getWikiPages(wiki.id);
 
-	private SearchableDocument toSearchableDocument(SinglePage obj) {
-		SearchableDocument document = new SearchableDocument();
-		document.type = "singlepage";
-		document.id = obj.id;
-		document.name = obj.name;
-		document.publishAt = obj.publishAt;
-		document.content = markdown.toText(textService.getById(obj.textId).content);
-		document.url = "/single/" + obj.id;
-		return document;
-	}
+            logger.info("try index 1 wiki...");
+            indexSearchableDocuments(List.of(this.toSearchableDocument(wiki)));
+            logger.info("try index {} wiki pages...", wps.size());
+            indexSearchableDocuments(wps.stream().map(wp -> this.toSearchableDocument(wiki, wp)).collect(Collectors.toList()));
+        }
+    }
 
-	public void indexArticles(Article... objs) throws Exception {
-		var documents = Arrays.stream(objs).map(this::toSearchableDocument).toArray(SearchableDocument[]::new);
-		indexSearchableDocuments(documents);
-	}
+    public SearchableDocument toSearchableDocument(Article a) {
+        var doc = new SearchableDocument();
+        doc.id = a.id;
+        doc.type = "article";
+        doc.name = a.name;
+        doc.content = a.description + "\n\n" + markdown.toText(textService.getById(a.textId).content);
+        doc.publishAt = a.publishAt;
+        doc.url = "/article/" + a.id;
+        return doc;
+    }
 
-	public void indexWiki(Wiki obj) throws Exception {
-		indexSearchableDocuments(this.toSearchableDocument(obj));
-	}
+    public SearchableDocument toSearchableDocument(Wiki w) {
+        var doc = new SearchableDocument();
+        doc.id = w.id;
+        doc.type = SearchableDocument.TYPE_WIKI;
+        doc.name = w.name;
+        doc.content = w.description + "\n\n" + markdown.toText(textService.getById(w.textId).content);
+        doc.publishAt = w.publishAt;
+        doc.url = "/wiki/" + w.id;
+        return doc;
+    }
 
-	public void indexWikiPages(WikiPage... objs) throws Exception {
-		var documents = Arrays.stream(objs).map(this::toSearchableDocument).toArray(SearchableDocument[]::new);
-		indexSearchableDocuments(documents);
-	}
+    public SearchableDocument toSearchableDocument(Wiki wiki, WikiPage wp) {
+        var doc = new SearchableDocument();
+        doc.id = wp.id;
+        doc.type = SearchableDocument.TYPE_WIKI_PAGE;
+        doc.name = wiki.name + " / " + wp.name;
+        doc.content = markdown.toText(textService.getById(wp.textId).content);
+        doc.publishAt = Long.max(wiki.publishAt, wp.publishAt);
+        doc.url = "/wiki/" + wp.wikiId + "/" + wp.id;
+        return doc;
+    }
 
-	public void indexSinglePages(SinglePage... objs) throws Exception {
-		var documents = Arrays.stream(objs).map(this::toSearchableDocument).toArray(SearchableDocument[]::new);
-		indexSearchableDocuments(documents);
-	}
+    /**
+     * Get engine name.
+     * 
+     * @return Engine name.
+     */
+    public abstract String getEngineName();
 
-	/**
-	 * DANGER operation: Remove ALL index.
-	 * 
-	 * @throws Exception
-	 */
-	public abstract void removeAllIndex() throws Exception;
+    /**
+     * Parse query to String array, or null if parse failed.
+     */
+    public List<String> parseQuery(String q) throws IOException {
+        if (!isReady) {
+            return null;
+        }
+        if (q == null) {
+            return null;
+        }
+        if (q.length() > this.maxQueryLength) {
+            q = q.substring(0, this.maxQueryLength);
+        }
+        q = q.strip();
+        if (q.isEmpty()) {
+            return null;
+        }
+        q = q.replaceAll("[\\s\\:\\/\\;\\,\\.\\*\\<\\>\\?\\!\\+\\&\\-\\？\\，\\、\\。\\！\\？\\；]+", " ");
 
-	/**
-	 * Add searchable documents.
-	 */
-	protected abstract void indexSearchableDocuments(SearchableDocument... documents) throws Exception;
+        ISegment segment = ISegment.MOST.factory.create(config, dict);
+        TextRankKeywordsExtractor extractor = new TextRankKeywordsExtractor(segment);
+        List<String> qs = extractor.getKeywords(new StringReader(q));
+        return qs;
+    }
 
-	/**
-	 * Remove a searchable document.
-	 * 
-	 * @param id
-	 * @throws IOException
-	 */
-	public abstract void unindexSearchableDocument(long id) throws Exception;
+    /**
+     * Search by keywords and return results. Return null if search condition is
+     * invalid.
+     */
+    public Hits search(List<String> qs, int maxResults) throws Exception {
+        if (!isReady) {
+            return Hits.empty();
+        }
+        Hits hits = search(qs, maxResults, System.currentTimeMillis());
+        logger.info("hits: total = {}.", hits.total);
+        return hits;
+    }
+
+    /**
+     * Search by parsed keywords.
+     * 
+     * @param qs         Parsed keywords.
+     * @param maxResults The max result list.
+     * @param timestamp  Current timestamp.
+     * @return Hits object.
+     * @throws IOException
+     */
+    protected abstract Hits search(List<String> qs, int maxResults, long timestamp) throws Exception;
+
+    public void indexArticles(Article... objs) throws Exception {
+        if (!isReady) {
+            logger.warn("skip index article for engine is not ready.");
+            return;
+        }
+        var documents = Arrays.stream(objs).map(this::toSearchableDocument).collect(Collectors.toList());
+        indexSearchableDocuments(documents);
+    }
+
+    public void indexWiki(Wiki wiki) throws Exception {
+        if (!isReady) {
+            logger.warn("skip index wiki for engine is not ready.");
+            return;
+        }
+        indexSearchableDocuments(List.of(this.toSearchableDocument(wiki)));
+    }
+
+    public void indexWikiPages(Wiki wiki, List<WikiPage> objs) throws Exception {
+        if (!isReady) {
+            logger.warn("skip index wikipage for engine is not ready.");
+            return;
+        }
+        var documents = objs.stream().map(wp -> toSearchableDocument(wiki, wp)).collect(Collectors.toList());
+        indexSearchableDocuments(documents);
+    }
+
+    public void createIndex() throws Exception {
+        IndexStatus status = doInitIndex();
+        switch (status) {
+        case CREATED -> {
+            indexAll();
+            isReady = true;
+        }
+        case EXIST -> isReady = true;
+        case FAILED -> logger.error("index could not be initialized and search is disabled.");
+        case REMOVED -> throw new IllegalArgumentException("Unexpected value: " + status);
+        default -> throw new IllegalArgumentException("Unexpected value: " + status);
+        }
+    }
+
+    /**
+     * DANGER operation: Remove ALL index.
+     * 
+     * @throws Exception
+     */
+    public void removeIndex() throws Exception {
+        if (!isReady) {
+            logger.warn("skip remove index for engine is not ready.");
+            return;
+        }
+        IndexStatus status = doRemoveIndex();
+        switch (status) {
+        case REMOVED -> isReady = false;
+        case FAILED -> logger.error("index could not be removed.");
+        case CREATED, EXIST -> throw new IllegalArgumentException("Unexpected value: " + status);
+        default -> throw new IllegalArgumentException("Unexpected value: " + status);
+        }
+    }
+
+    protected abstract IndexStatus doInitIndex() throws Exception;
+
+    protected abstract IndexStatus doRemoveIndex() throws Exception;
+
+    /**
+     * Add searchable documents.
+     */
+    protected abstract void indexSearchableDocuments(List<SearchableDocument> documents) throws Exception;
+
+    /**
+     * Remove a searchable document.
+     * 
+     * @param id
+     * @throws IOException
+     */
+    public abstract boolean unindexSearchableDocument(long id) throws Exception;
 
 }
